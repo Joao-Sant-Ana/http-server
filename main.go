@@ -1,142 +1,224 @@
 package main
 
 import (
+	"bufio"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
-	"time"
+
+	"gopkg.in/yaml.v3"
 )
+
+type Server struct {
+	Path string `yaml:"path"`
+	Address string `yaml:"address"`
+}
+
+type Config struct {
+	Servers map[string] Server `yaml:"servers"`
+}
+
+var requests = make(chan net.Conn, 512)
 
 func main() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGINT, os.Interrupt)
 
-	log.Println("Hello world")
+	_, err := os.ReadDir("./sites-available")
+	if err != nil {
+		if os.IsNotExist(err) {
+			err := os.Mkdir("./sites-available", 0755)
+			if err != nil {
+				log.Fatalf("Error creating sites-available folder: %v", err)
+			}
+			file, err := os.Create("./sites-available/default.yaml")
+			if err != nil {
+				log.Fatalf("Error creating default file: %v", err)
+			}
+			defaultConfig := &Config{
+				Servers: map[string]Server{
+					"default": {
+						Path: "localhost:3000",
+						Address: "",
+					},
+				},
+			}
+			marshaledConfig, err := yaml.Marshal(defaultConfig)
+			if err != nil {
+				log.Fatalf("Error formating config: %v", err)
+			}
+
+			if _, err := file.Write(marshaledConfig); err != nil {
+				log.Fatalf("Error writing default config file: %v", err)
+			}
+		} else {
+			log.Fatalf("Error while reading the sites-available dir: %v", err)
+		}
+	}
+
+	files, err := os.ReadDir("./sites-enabled")
+	if err != nil {
+		if os.IsNotExist(err) {
+			if err := os.Mkdir("./sites-enabled", 0755); err != nil {
+				log.Fatalf("Error creating sites-enabled folder: %v", err)
+			}
+
+			if err := os.Link("./sites-available/default.yaml", "./sites-enabled/default.yaml"); err != nil {
+				log.Fatalf("Error linking default files: %v", err)
+			}
+		} else {
+			log.Fatalf("Error while reading the sites-enabled dir: %v", err)
+		}
+	}
+
+	var addresses []Config
+
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+
+		config, err := loadConfig(fmt.Sprintf("./sites-enabled/%s", file.Name()))
+		if err != nil {
+			log.Fatalf("Error while getting config: %v", err)
+		}
+		log.Println(config)
+
+		addresses = append(addresses, config)
+	}
+
 	ln, err := net.Listen("tcp", "0.0.0.0:8000")
 	if err != nil {
 		log.Fatalf("Error: %v\n", err)
 	}
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.Printf("Error: %v\n", err)
-			break
+	go reverseProxy(addresses)
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				log.Printf("Error: %v\n", err)
+				break
+			}
+			
+			requests <- conn
 		}
-
-		go handleConn(conn)
-	}
-
+	}()
+	
 	<-c
 }
 
-func handleConn(c net.Conn) {
-	defer c.Close()
-	r := make([]byte, 256)
-	c.SetReadDeadline(time.Now().Add(5 * time.Second))
-	_, err := c.Read(r)
-	if err != nil {
-		log.Printf("Error: %v\n", err)
-	}
+func reverseProxy(addresses []Config) {
+	for conn := range requests {
+		go func() {
+			defer conn.Close()
 
-	response := "HTTP/1.1 404 NOT FOUND\r\n\r\n"
-	_, err = c.Write([]byte(response))
-	if err != nil {
-		log.Printf("Error: %v\n", err)
+			reader := bufio.NewReader(conn)
+
+			requestLine, err := reader.ReadString('\n')
+			if err != nil {
+				log.Printf("Failed to read request line: %v", err)
+				return
+			}
+
+			var headers []string
+			var host string
+
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					log.Printf("Failed to read headers: %v", err)
+					return
+				}
+
+				line = strings.TrimSpace(line)
+
+				if line == "" {
+					break
+				}
+
+				headers = append(headers, line)
+
+				if strings.HasPrefix(strings.ToLower(line), "host:") {
+					host = strings.TrimSpace(strings.TrimPrefix(line, "Host:"))
+					host = strings.TrimSpace(strings.TrimPrefix(host, "host:"))
+				}
+			}
+
+			var targetServer *Server
+			for _, address := range addresses {
+				for _, value := range address.Servers {
+					if value.Address == host {
+						targetServer = &value
+						break
+					}
+				}
+				if targetServer != nil {
+					break
+				}
+			}
+
+			if targetServer == nil {
+				log.Printf("No server found for host: %s", host)
+				conn.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"))
+				return
+			}
+
+			targetConn, err := net.Dial("tcp", targetServer.Path)
+			if err != nil {
+				log.Printf("Error connecting to target server: %v", err)
+				conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"))
+				return
+			}
+			defer targetConn.Close()
+
+			_, err = targetConn.Write([]byte(requestLine))
+			if err != nil {
+				log.Printf("Error writing request line: %v", err)
+				return
+			}
+
+			for _, header := range headers {
+				_, err = targetConn.Write([]byte(header + "\r\n"))
+				if err != nil {
+					log.Printf("Error writing header: %v", err)
+					return
+				}
+			}
+
+			_, err = targetConn.Write([]byte("\r\n"))
+			if err != nil {
+				log.Printf("Error writing header terminator: %v", err)
+				return
+			}
+
+			go func() {
+				defer targetConn.Close()
+				io.Copy(targetConn, reader)
+			}()
+
+			io.Copy(conn, targetConn)
+		}()
 	}
 }
 
-func getResponseStatus(s int) string {
-	responseHeader := "HTTP/1.1 "
-
-	switch s {
-	// Informational
-	case 100:
-		responseHeader += "100 CONTINUE\r\n"
-	case 101:
-		responseHeader += "101 SWITCHING PROTOCOLS\r\n"
-	case 102:
-		responseHeader += "102 PROCESSING\r\n"
-
-	// Successful
-	case 200:
-		responseHeader += "200 OK\r\n"
-	case 201:
-		responseHeader += "201 CREATED\r\n"
-	case 202:
-		responseHeader += "202 ACCEPTED\r\n"
-	case 203:
-		responseHeader += "203 NON-AUTHORITATIVE INFORMATION\r\n"
-	case 204:
-		responseHeader += "204 NO CONTENT\r\n"
-	case 205:
-		responseHeader += "205 RESET CONTENT\r\n"
-	case 206:
-		responseHeader += "206 PARTIAL CONTENT\r\n"
-	case 207:
-		responseHeader += "207 MULTI-STATUS\r\n"
-	case 208:
-		responseHeader += "208 ALREADY REPORTED\r\n"
-
-	// Redirection
-	case 300:
-		responseHeader += "300 MULTIPLE CHOICES\r\n"
-	case 301:
-		responseHeader += "301 MOVED PERMANENTLY\r\n"
-	case 302:
-		responseHeader += "302 FOUND\r\n"
-	case 303:
-		responseHeader += "303 SEE OTHER\r\n"
-	case 304:
-		responseHeader += "304 NOT MODIFIED\r\n"
-	case 305:
-		responseHeader += "305 USE PROXY\r\n"
-	case 307:
-		responseHeader += "307 TEMPORARY REDIRECT\r\n"
-	case 308:
-		responseHeader += "308 PERMANENT REDIRECT\r\n"
-
-	// Client Error
-	case 400:
-		responseHeader += "400 BAD REQUEST\r\n"
-	case 401:
-		responseHeader += "401 UNAUTHORIZED\r\n"
-	case 402:
-		responseHeader += "402 PAYMENT REQUIRED\r\n"
-	case 403:
-		responseHeader += "403 FORBIDDEN\r\n"
-	case 404:
-		responseHeader += "404 NOT FOUND\r\n"
-	case 405:
-		responseHeader += "405 METHOD NOT ALLOWED\r\n"
-	case 406:
-		responseHeader += "406 NOT ACCEPTABLE\r\n"
-	case 407:
-		responseHeader += "407 PROXY AUTHENTICATION REQUIRED\r\n"
-	case 408:
-		responseHeader += "408 REQUEST TIMEOUT\r\n"
-	case 409:
-		responseHeader += "409 CONFLICT\r\n"
-
-	// Server Error
-	case 500:
-		responseHeader += "500 INTERNAL SERVER ERROR\r\n"
-	case 501:
-		responseHeader += "501 NOT IMPLEMENTED\r\n"
-	case 502:
-		responseHeader += "502 BAD GATEWAY\r\n"
-	case 503:
-		responseHeader += "503 SERVICE UNAVAILABLE\r\n"
-	case 504:
-		responseHeader += "504 GATEWAY TIMEOUT\r\n"
-	case 505:
-		responseHeader += "505 HTTP VERSION NOT SUPPORTED\r\n"
-
-	default:
-		responseHeader += "500 INTERNAL SERVER ERROR\r\n"
+func loadConfig(path string) (Config, error) {
+	var cfg Config
+	f, err := os.Open(path)
+	if err != nil {
+		return cfg, err
 	}
-
-	return responseHeader
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return cfg, err
+	}
+	err = yaml.Unmarshal(data, &cfg)
+	return cfg, err
 }
